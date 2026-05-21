@@ -1,206 +1,251 @@
 #include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 #include <TFT_eSPI.h>
+#include <time.h>
+#include "config.h"
 
 TFT_eSPI tft = TFT_eSPI();
 
-const int          NUM_PANES   = 3;
-const unsigned long DURATIONS[] = {8000, 5000, 5000}; // ms per pane
-
-int           currentPane = 0;
-unsigned long paneStart   = 0;
-
-// ── Pane 0: Star Wars ─────────────────────────────────────────────────────────
-
-const char* DEATH_STAR[] = {
-  "      .-------.    ",
-  "    .'  *      '.  ",
-  "   /   .------.  \\",
-  "  |   /  o  o  \\  |",
-  "  |--              --|",
-  "  |   \\  o  o  /  |",
-  "   \\   '------'  /",
-  "    '.           .'",
-  "      '-------'    ",
+struct UsageData {
+  long input  = 0;
+  long output = 0;
+  long total  = 0;
+  bool valid  = false;
 };
-const int DS_LINES = 9;
 
-const char* CRAWL[] = {
-  "A long time ago in a",
-  "galaxy far, far away...",
-  "",
-  "     Episode IV",
-  "     A NEW HOPE",
-  "",
-  "It is a period of",
-  "civil war. Rebel",
-  "spaceships have won",
-  "their first victory.",
-};
-const int CRAWL_COUNT = 10;
+UsageData monthly;
+UsageData session;
+unsigned long lastFetchMs = 0;
+char          lastSyncTime[8] = "--:--";
+bool          wifiOk          = false;
 
-void drawStarWarsPane() {
-  tft.fillScreen(TFT_BLACK);
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-  // "STAR WARS" centered at top
-  tft.setTextDatum(TC_DATUM);
-  tft.setTextSize(3);
-  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  tft.drawString("STAR WARS", 160, 6);
-
-  // Death Star ASCII, centered horizontally
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextSize(1);
-  tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  for (int i = 0; i < DS_LINES; i++)
-    tft.drawString(DEATH_STAR[i], 86, 38 + i * 10);
-
-  // Episode crawl text, each line centered
-  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  for (int i = 0; i < CRAWL_COUNT; i++) {
-    int x = (320 - (int)strlen(CRAWL[i]) * 6) / 2;
-    if (x < 0) x = 0;
-    tft.drawString(CRAWL[i], x, 132 + i * 10);
-  }
-
-  tft.setTextColor(tft.color565(50, 50, 50), TFT_BLACK);
-  tft.drawString("1/3  Star Wars", 5, 230);
+String fmtNum(long n) {
+  String s   = String(n);
+  int    pos = s.length() - 3;
+  while (pos > 0) { s = s.substring(0, pos) + "," + s.substring(pos); pos -= 3; }
+  return s;
 }
 
-// ── Pane 1: Starfield ─────────────────────────────────────────────────────────
-
-#define NUM_STARS 100
-struct Star { float x, y, z; int16_t px, py; };
-Star stars[NUM_STARS];
-
-void resetStar(int i) {
-  stars[i] = {
-    (float)random(-160, 160),
-    (float)random(-120, 120),
-    (float)random(20, 100),
-    -1, -1
-  };
+void toISO(char* buf, size_t len, time_t t) {
+  strftime(buf, len, "%Y-%m-%dT%H:%M:%SZ", gmtime(&t));
 }
 
-void initStars() {
-  for (int i = 0; i < NUM_STARS; i++) resetStar(i);
-}
+// ── API ───────────────────────────────────────────────────────────────────────
 
-void tickStarfield() {
-  for (int i = 0; i < NUM_STARS; i++) {
-    // erase old pixel
-    if (stars[i].px >= 0)
-      tft.drawPixel(stars[i].px, stars[i].py, TFT_BLACK);
+bool fetchUsage(const char* startISO, const char* endISO,
+                const char* bucketWidth, int limit, UsageData& out) {
+  WiFiClientSecure client;
+  client.setInsecure(); // home device — skip cert pinning
+  client.setTimeout(15);
 
-    stars[i].z -= 1.2f;
-    if (stars[i].z <= 1) { resetStar(i); continue; }
+  HTTPClient http;
+  char url[300];
+  snprintf(url, sizeof(url),
+    "https://api.anthropic.com/v1/organizations/usage_report/messages"
+    "?starting_at=%s&ending_at=%s&bucket_width=%s&limit=%d",
+    startISO, endISO, bucketWidth, limit);
 
-    int16_t nx = (int16_t)(stars[i].x / stars[i].z * 120 + 160);
-    int16_t ny = (int16_t)(stars[i].y / stars[i].z * 120 + 120);
-    stars[i].px = nx;
-    stars[i].py = ny;
+  if (!http.begin(client, url)) return false;
+  http.addHeader("anthropic-version", "2023-06-01");
+  http.addHeader("x-api-key", ANTHROPIC_ADMIN_KEY);
+  http.setTimeout(15000);
 
-    if (nx >= 0 && nx < 320 && ny >= 0 && ny < 240) {
-      uint8_t b = (uint8_t)(220 - stars[i].z * 1.85f);
-      tft.drawPixel(nx, ny, tft.color565(b, b, b));
+  int code = http.GET();
+  if (code != 200) { http.end(); return false; }
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, http.getStream());
+  http.end();
+  if (err) return false;
+
+  long inputSum = 0, outputSum = 0;
+  for (JsonObject bucket : doc["data"].as<JsonArray>()) {
+    for (JsonObject r : bucket["results"].as<JsonArray>()) {
+      inputSum  += r["uncached_input_tokens"].as<long>();
+      inputSum  += r["cache_read_input_tokens"].as<long>();
+      inputSum  += r["cache_creation"]["ephemeral_1h_input_tokens"].as<long>();
+      inputSum  += r["cache_creation"]["ephemeral_5m_input_tokens"].as<long>();
+      outputSum += r["output_tokens"].as<long>();
     }
   }
+
+  out = { inputSum, outputSum, inputSum + outputSum, true };
+  return true;
 }
 
-// ── Pane 2: System Info ───────────────────────────────────────────────────────
+void fetchAll() {
+  time_t now = time(nullptr);
+  if (now < 1000000) return; // NTP not synced
 
-void drawSystemPane() {
-  tft.fillScreen(TFT_BLACK);
-  char buf[48];
+  char nowStr[30], monthStartStr[30], sessionStartStr[30];
+  toISO(nowStr, sizeof(nowStr), now);
+  toISO(sessionStartStr, sizeof(sessionStartStr), now - 5 * 3600);
 
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextSize(2);
-  tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  tft.drawString("[ ESP32 STATUS ]", 10, 8);
+  // Start of current UTC month
+  struct tm t = *gmtime(&now);
+  t.tm_mday = 1; t.tm_hour = 0; t.tm_min = 0; t.tm_sec = 0;
+  toISO(monthStartStr, sizeof(monthStartStr), mktime(&t));
+
+  fetchUsage(monthStartStr, nowStr, "1d", 31, monthly);
+  fetchUsage(sessionStartStr, nowStr, "1h",  5, session);
+
+  strftime(lastSyncTime, sizeof(lastSyncTime), "%H:%M", gmtime(&now));
+  lastFetchMs = millis();
+}
+
+// ── Display ───────────────────────────────────────────────────────────────────
+
+void drawFooter() {
+  tft.fillRect(0, 163, 320, 240 - 163, TFT_BLACK);
+  tft.drawFastHLine(0, 163, 320, tft.color565(60, 60, 60));
+
+  char buf[64];
+  if (!wifiOk) {
+    snprintf(buf, sizeof(buf), "WiFi: connecting...");
+  } else if (!monthly.valid) {
+    snprintf(buf, sizeof(buf), "Fetching from Anthropic...");
+  } else {
+    unsigned long nextIn = 5 - min(5UL, (millis() - lastFetchMs) / 60000UL);
+    snprintf(buf, sizeof(buf), "Last sync: %s   next in %lum", lastSyncTime, nextIn);
+  }
 
   tft.setTextSize(1);
-
-  auto row = [&](int y, const char* label, const char* val, uint16_t col) {
-    tft.setTextColor(tft.color565(130, 130, 130), TFT_BLACK);
-    tft.drawString(label, 10, y);
-    tft.setTextColor(col, TFT_BLACK);
-    tft.drawString(val, 110, y);
-  };
-
-  unsigned long s = millis() / 1000;
-  snprintf(buf, sizeof(buf), "%02luh %02lum %02lus", s/3600, (s%3600)/60, s%60);
-  row(40, "Uptime:", buf, TFT_WHITE);
-
-  snprintf(buf, sizeof(buf), "%lu KB", ESP.getFreeHeap() / 1024);
-  row(56, "Free heap:", buf, TFT_CYAN);
-
-  snprintf(buf, sizeof(buf), "%d MHz", getCpuFrequencyMhz());
-  row(72, "CPU freq:", buf, TFT_YELLOW);
-
-  snprintf(buf, sizeof(buf), "rev %d", ESP.getChipRevision());
-  row(88, "Chip:", buf, TFT_WHITE);
-
-  // Heap usage bar
-  uint32_t total = ESP.getHeapSize();
-  uint32_t used  = total - ESP.getFreeHeap();
-  int barW  = 300;
-  int usedW = (int)((float)used / total * barW);
-  usedW = max(2, min(usedW, barW - 2));
-
-  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  tft.drawString("Heap:", 10, 108);
-  snprintf(buf, sizeof(buf), "%d%%", (int)((float)used / total * 100));
-  tft.setTextDatum(TR_DATUM);
-  tft.drawString(buf, 312, 108);
   tft.setTextDatum(TL_DATUM);
-
-  tft.drawRect(10, 120, barW, 14, TFT_WHITE);
-  tft.fillRect(11, 121, usedW - 2, 12, TFT_RED);
-  tft.fillRect(10 + usedW, 121, barW - usedW - 1, 12, TFT_DARKGREEN);
-
-  tft.setTextColor(tft.color565(50, 50, 50), TFT_BLACK);
-  tft.drawString("3/3  System Info", 5, 230);
+  tft.setTextColor(tft.color565(80, 80, 80), TFT_BLACK);
+  tft.drawString(buf, 8, 170);
 }
 
-// ── Pane switching ────────────────────────────────────────────────────────────
+void drawScreen() {
+  tft.fillScreen(TFT_BLACK);
 
-void switchPane(int p) {
-  currentPane = p;
-  paneStart   = millis();
+  // ── Header ────────────────────────────────────────────────
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawString("CLAUDE API USAGE", 160, 5);
+  tft.drawFastHLine(0, 26, 320, tft.color565(60, 60, 60));
 
-  switch (p) {
-    case 0:
-      drawStarWarsPane();
-      break;
-    case 1:
-      tft.fillScreen(TFT_BLACK);
-      initStars();
-      tft.setTextDatum(TL_DATUM);
-      tft.setTextSize(1);
-      tft.setTextColor(tft.color565(50, 50, 50), TFT_BLACK);
-      tft.drawString("2/3  Starfield", 5, 230);
-      break;
-    case 2:
-      drawSystemPane();
-      break;
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextSize(1);
+
+  // ── Monthly ───────────────────────────────────────────────
+  tft.setTextColor(tft.color565(160, 160, 160), TFT_BLACK);
+  tft.drawString("THIS MONTH", 8, 31);
+
+  if (!monthly.valid) {
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.drawString("Fetching...", 8, 44);
+  } else {
+    auto row = [&](int y, const char* label, String val, uint16_t col) {
+      tft.setTextColor(tft.color565(110, 110, 110), TFT_BLACK);
+      tft.drawString(label, 8, y);
+      tft.setTextColor(col, TFT_BLACK);
+      tft.drawString(val.c_str(), 60, y);
+    };
+    row(44, "In:",    fmtNum(monthly.input)  + " tk", TFT_WHITE);
+    row(56, "Out:",   fmtNum(monthly.output) + " tk", TFT_WHITE);
+    row(68, "Total:", fmtNum(monthly.total),           TFT_CYAN);
+
+    // Progress bar
+    float    pct   = min(1.0f, (float)monthly.total / MONTHLY_TOKEN_LIMIT);
+    int      barW  = 300;
+    int      fillW = max(0, (int)(pct * barW));
+    uint16_t barCol = (pct >= 0.9f) ? TFT_RED : TFT_GREEN;
+
+    tft.drawRect(10, 81, barW, 12, TFT_WHITE);
+    if (fillW > 2)          tft.fillRect(11,          82, fillW - 2,      10, barCol);
+    if (fillW < barW - 1)   tft.fillRect(11 + fillW,  82, barW - fillW - 1, 10, tft.color565(35, 35, 35));
+
+    char pctBuf[8];
+    snprintf(pctBuf, sizeof(pctBuf), "%d%%", (int)(pct * 100));
+    tft.setTextColor(tft.color565(100, 100, 100), TFT_BLACK);
+    tft.drawString((fmtNum(monthly.total) + " of " + fmtNum(MONTHLY_TOKEN_LIMIT)).c_str(), 8, 96);
+    tft.setTextDatum(TR_DATUM);
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.drawString(pctBuf, 312, 96);
+    tft.setTextDatum(TL_DATUM);
+  }
+
+  tft.drawFastHLine(0, 108, 320, tft.color565(60, 60, 60));
+
+  // ── Session ───────────────────────────────────────────────
+  tft.setTextColor(tft.color565(160, 160, 160), TFT_BLACK);
+  tft.drawString("SESSION  (last 5h)", 8, 113);
+
+  if (!session.valid) {
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.drawString("Fetching...", 8, 126);
+  } else {
+    auto row = [&](int y, const char* label, String val, uint16_t col) {
+      tft.setTextColor(tft.color565(110, 110, 110), TFT_BLACK);
+      tft.drawString(label, 8, y);
+      tft.setTextColor(col, TFT_BLACK);
+      tft.drawString(val.c_str(), 60, y);
+    };
+    row(126, "In:",    fmtNum(session.input)  + " tk", TFT_WHITE);
+    row(138, "Out:",   fmtNum(session.output) + " tk", TFT_WHITE);
+    row(150, "Total:", fmtNum(session.total),           TFT_CYAN);
+  }
+
+  drawFooter();
+}
+
+// ── WiFi / NTP ────────────────────────────────────────────────────────────────
+
+void connectWifi() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("Connecting to WiFi...", 160, 110);
+  tft.drawString(WIFI_SSID, 160, 124);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) delay(500);
+  wifiOk = (WiFi.status() == WL_CONNECTED);
+
+  if (wifiOk) {
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    struct tm t;
+    for (int i = 0; i < 20 && !getLocalTime(&t); i++) delay(500);
   }
 }
 
-// ── Arduino entry points ──────────────────────────────────────────────────────
+// ── Entry points ──────────────────────────────────────────────────────────────
 
 void setup() {
   Serial.begin(115200);
+  pinMode(21, OUTPUT);
+  digitalWrite(21, HIGH);
   tft.init();
-  tft.setRotation(1); // landscape 320x240
-  randomSeed(analogRead(36));
-  switchPane(0);
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+
+  connectWifi();
+  if (wifiOk) fetchAll();
+  drawScreen();
 }
 
 void loop() {
-  if (millis() - paneStart >= DURATIONS[currentPane])
-    switchPane((currentPane + 1) % NUM_PANES);
-
-  if (currentPane == 1) {
-    tickStarfield();
-    delay(20);
+  if (WiFi.status() != WL_CONNECTED) {
+    wifiOk = false;
+    WiFi.reconnect();
+    delay(3000);
+    wifiOk = (WiFi.status() == WL_CONNECTED);
   }
+
+  if (wifiOk && (lastFetchMs == 0 || millis() - lastFetchMs >= 5UL * 60 * 1000)) {
+    fetchAll();
+    drawScreen();
+  } else {
+    drawFooter(); // update the countdown without a full redraw
+  }
+
+  delay(30000);
 }

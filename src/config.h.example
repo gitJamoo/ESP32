@@ -1,0 +1,15 @@
+#pragma once
+
+// ── WiFi ──────────────────────────────────────────────────────────────────────
+#define WIFI_SSID     "your_wifi_name"
+#define WIFI_PASSWORD "your_wifi_password"
+
+// ── Anthropic Admin API key ───────────────────────────────────────────────────
+// IMPORTANT: must be an Admin key (sk-ant-admin...), NOT a regular API key.
+// Create one at: console.anthropic.com/settings/admin-keys
+#define ANTHROPIC_ADMIN_KEY "sk-ant-admin-your-key-here"
+
+// ── Monthly token limit (for the progress bar) ────────────────────────────────
+// Set this to match your plan's limit or your own budget.
+// Examples: 1000000 = 1M tokens, 5000000 = 5M tokens
+#define MONTHLY_TOKEN_LIMIT 2000000L
