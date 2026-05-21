@@ -1,123 +1,99 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <TFT_eSPI.h>
-#include <time.h>
 #include "config.h"
 
 TFT_eSPI tft = TFT_eSPI();
 
-struct UsageData {
-  long input  = 0;
-  long output = 0;
-  long total  = 0;
-  bool valid  = false;
+struct Usage {
+  int  sessionPct  = 0;   // 5h utilization 0-100
+  int  sessionReset = 0;  // minutes until 5h window resets
+  int  weeklyPct   = 0;   // 7d utilization 0-100
+  int  weeklyReset  = 0;  // minutes until 7d window resets
+  bool ok          = false;
 };
 
-UsageData monthly;
-UsageData session;
+Usage latest;
 unsigned long lastFetchMs = 0;
 char          lastSyncTime[8] = "--:--";
-bool          wifiOk          = false;
+bool          wifiOk = false;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-String fmtNum(long n) {
-  String s   = String(n);
-  int    pos = s.length() - 3;
-  while (pos > 0) { s = s.substring(0, pos) + "," + s.substring(pos); pos -= 3; }
-  return s;
+// Format minutes as "47m", "2h 15m", or "3d 4h"
+String fmtTime(int minutes) {
+  if (minutes <= 0) return "now";
+  if (minutes < 60) {
+    char buf[8]; snprintf(buf, sizeof(buf), "%dm", minutes); return buf;
+  }
+  if (minutes < 1440) {
+    char buf[12]; snprintf(buf, sizeof(buf), "%dh %dm", minutes / 60, minutes % 60); return buf;
+  }
+  char buf[12]; snprintf(buf, sizeof(buf), "%dd %dh", minutes / 1440, (minutes % 1440) / 60);
+  return buf;
 }
 
-void toISO(char* buf, size_t len, time_t t) {
-  strftime(buf, len, "%Y-%m-%dT%H:%M:%SZ", gmtime(&t));
-}
+// ── Fetch ─────────────────────────────────────────────────────────────────────
 
-// ── API ───────────────────────────────────────────────────────────────────────
-
-bool fetchUsage(const char* startISO, const char* endISO,
-                const char* bucketWidth, int limit, UsageData& out) {
-  WiFiClientSecure client;
-  client.setInsecure(); // home device — skip cert pinning
-  client.setTimeout(15);
-
+void fetchUsage() {
   HTTPClient http;
-  char url[300];
-  snprintf(url, sizeof(url),
-    "https://api.anthropic.com/v1/organizations/usage_report/messages"
-    "?starting_at=%s&ending_at=%s&bucket_width=%s&limit=%d",
-    startISO, endISO, bucketWidth, limit);
+  char url[64];
+  snprintf(url, sizeof(url), "http://" PC_HOST ":%d/usage", PC_PORT);
 
-  if (!http.begin(client, url)) return false;
-  http.addHeader("anthropic-version", "2023-06-01");
-  http.addHeader("x-api-key", ANTHROPIC_ADMIN_KEY);
-  http.setTimeout(15000);
-
+  if (!http.begin(url)) return;
+  http.setTimeout(8000);
   int code = http.GET();
-  if (code != 200) { http.end(); return false; }
+  if (code != 200) { http.end(); return; }
 
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, http.getStream());
   http.end();
-  if (err) return false;
+  if (err || !doc["ok"].as<bool>()) return;
 
-  long inputSum = 0, outputSum = 0;
-  for (JsonObject bucket : doc["data"].as<JsonArray>()) {
-    for (JsonObject r : bucket["results"].as<JsonArray>()) {
-      inputSum  += r["uncached_input_tokens"].as<long>();
-      inputSum  += r["cache_read_input_tokens"].as<long>();
-      inputSum  += r["cache_creation"]["ephemeral_1h_input_tokens"].as<long>();
-      inputSum  += r["cache_creation"]["ephemeral_5m_input_tokens"].as<long>();
-      outputSum += r["output_tokens"].as<long>();
-    }
-  }
+  latest.sessionPct   = doc["s"].as<int>();
+  latest.sessionReset = doc["sr"].as<int>();
+  latest.weeklyPct    = doc["w"].as<int>();
+  latest.weeklyReset  = doc["wr"].as<int>();
+  latest.ok           = true;
 
-  out = { inputSum, outputSum, inputSum + outputSum, true };
-  return true;
-}
-
-void fetchAll() {
+  // Capture sync time from NTP
   time_t now = time(nullptr);
-  if (now < 1000000) return; // NTP not synced
+  if (now > 1000000) strftime(lastSyncTime, sizeof(lastSyncTime), "%H:%M", localtime(&now));
 
-  char nowStr[30], monthStartStr[30], sessionStartStr[30];
-  toISO(nowStr, sizeof(nowStr), now);
-  toISO(sessionStartStr, sizeof(sessionStartStr), now - 5 * 3600);
-
-  // Start of current UTC month
-  struct tm t = *gmtime(&now);
-  t.tm_mday = 1; t.tm_hour = 0; t.tm_min = 0; t.tm_sec = 0;
-  toISO(monthStartStr, sizeof(monthStartStr), mktime(&t));
-
-  fetchUsage(monthStartStr, nowStr, "1d", 31, monthly);
-  fetchUsage(sessionStartStr, nowStr, "1h",  5, session);
-
-  strftime(lastSyncTime, sizeof(lastSyncTime), "%H:%M", gmtime(&now));
   lastFetchMs = millis();
 }
 
 // ── Display ───────────────────────────────────────────────────────────────────
 
+void drawBar(int x, int y, int w, int h, int pct) {
+  int      fill   = max(0, min(w - 2, ((w - 2) * pct) / 100));
+  uint16_t barCol = (pct >= 80) ? TFT_RED : (pct >= 60 ? TFT_YELLOW : TFT_GREEN);
+  tft.drawRect(x, y, w, h, TFT_WHITE);
+  if (fill > 0)
+    tft.fillRect(x + 1, y + 1, fill, h - 2, barCol);
+  if (fill < w - 2)
+    tft.fillRect(x + 1 + fill, y + 1, w - 2 - fill, h - 2, tft.color565(35, 35, 35));
+}
+
 void drawFooter() {
-  tft.fillRect(0, 163, 320, 240 - 163, TFT_BLACK);
-  tft.drawFastHLine(0, 163, 320, tft.color565(60, 60, 60));
+  tft.fillRect(0, 175, 320, 65, TFT_BLACK);
+  tft.drawFastHLine(0, 175, 320, tft.color565(55, 55, 55));
 
   char buf[64];
   if (!wifiOk) {
     snprintf(buf, sizeof(buf), "WiFi: connecting...");
-  } else if (!monthly.valid) {
-    snprintf(buf, sizeof(buf), "Fetching from Anthropic...");
+  } else if (!latest.ok) {
+    snprintf(buf, sizeof(buf), "Waiting for daemon...");
   } else {
     unsigned long nextIn = 5 - min(5UL, (millis() - lastFetchMs) / 60000UL);
     snprintf(buf, sizeof(buf), "Last sync: %s   next in %lum", lastSyncTime, nextIn);
   }
-
   tft.setTextSize(1);
   tft.setTextDatum(TL_DATUM);
   tft.setTextColor(tft.color565(80, 80, 80), TFT_BLACK);
-  tft.drawString(buf, 8, 170);
+  tft.drawString(buf, 8, 182);
 }
 
 void drawScreen() {
@@ -127,70 +103,53 @@ void drawScreen() {
   tft.setTextDatum(TC_DATUM);
   tft.setTextSize(2);
   tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  tft.drawString("CLAUDE API USAGE", 160, 5);
-  tft.drawFastHLine(0, 26, 320, tft.color565(60, 60, 60));
+  tft.drawString("CLAUDE USAGE", 160, 6);
+  tft.drawFastHLine(0, 27, 320, tft.color565(55, 55, 55));
 
   tft.setTextDatum(TL_DATUM);
   tft.setTextSize(1);
 
-  // ── Monthly ───────────────────────────────────────────────
-  tft.setTextColor(tft.color565(160, 160, 160), TFT_BLACK);
-  tft.drawString("THIS MONTH", 8, 31);
-
-  if (!monthly.valid) {
+  if (!latest.ok) {
     tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    tft.drawString("Fetching...", 8, 44);
-  } else {
-    auto row = [&](int y, const char* label, String val, uint16_t col) {
-      tft.setTextColor(tft.color565(110, 110, 110), TFT_BLACK);
-      tft.drawString(label, 8, y);
-      tft.setTextColor(col, TFT_BLACK);
-      tft.drawString(val.c_str(), 60, y);
-    };
-    row(44, "In:",    fmtNum(monthly.input)  + " tk", TFT_WHITE);
-    row(56, "Out:",   fmtNum(monthly.output) + " tk", TFT_WHITE);
-    row(68, "Total:", fmtNum(monthly.total),           TFT_CYAN);
-
-    // Progress bar
-    float    pct   = min(1.0f, (float)monthly.total / MONTHLY_TOKEN_LIMIT);
-    int      barW  = 300;
-    int      fillW = max(0, (int)(pct * barW));
-    uint16_t barCol = (pct >= 0.9f) ? TFT_RED : TFT_GREEN;
-
-    tft.drawRect(10, 81, barW, 12, TFT_WHITE);
-    if (fillW > 2)          tft.fillRect(11,          82, fillW - 2,      10, barCol);
-    if (fillW < barW - 1)   tft.fillRect(11 + fillW,  82, barW - fillW - 1, 10, tft.color565(35, 35, 35));
-
-    char pctBuf[8];
-    snprintf(pctBuf, sizeof(pctBuf), "%d%%", (int)(pct * 100));
-    tft.setTextColor(tft.color565(100, 100, 100), TFT_BLACK);
-    tft.drawString((fmtNum(monthly.total) + " of " + fmtNum(MONTHLY_TOKEN_LIMIT)).c_str(), 8, 96);
-    tft.setTextDatum(TR_DATUM);
-    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    tft.drawString(pctBuf, 312, 96);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString(!wifiOk ? "Connecting to WiFi..." : "Waiting for daemon on PC...", 160, 100);
     tft.setTextDatum(TL_DATUM);
+    drawFooter();
+    return;
   }
 
-  tft.drawFastHLine(0, 108, 320, tft.color565(60, 60, 60));
-
-  // ── Session ───────────────────────────────────────────────
+  // ── Session (5h) ──────────────────────────────────────────
   tft.setTextColor(tft.color565(160, 160, 160), TFT_BLACK);
-  tft.drawString("SESSION  (last 5h)", 8, 113);
+  tft.drawString("SESSION  (5h)", 8, 34);
 
-  if (!session.valid) {
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    tft.drawString("Fetching...", 8, 126);
-  } else {
-    auto row = [&](int y, const char* label, String val, uint16_t col) {
-      tft.setTextColor(tft.color565(110, 110, 110), TFT_BLACK);
-      tft.drawString(label, 8, y);
-      tft.setTextColor(col, TFT_BLACK);
-      tft.drawString(val.c_str(), 60, y);
-    };
-    row(126, "In:",    fmtNum(session.input)  + " tk", TFT_WHITE);
-    row(138, "Out:",   fmtNum(session.output) + " tk", TFT_WHITE);
-    row(150, "Total:", fmtNum(session.total),           TFT_CYAN);
-  }
+  char pctBuf[8];
+  snprintf(pctBuf, sizeof(pctBuf), "%d%%", latest.sessionPct);
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextColor(latest.sessionPct >= 80 ? TFT_RED : TFT_WHITE, TFT_BLACK);
+  tft.drawString(pctBuf, 314, 34);
+  tft.setTextDatum(TL_DATUM);
+
+  drawBar(8, 48, 304, 22, latest.sessionPct);
+
+  tft.setTextColor(tft.color565(110, 110, 110), TFT_BLACK);
+  tft.drawString(("Resets in " + fmtTime(latest.sessionReset)).c_str(), 8, 76);
+
+  tft.drawFastHLine(0, 90, 320, tft.color565(55, 55, 55));
+
+  // ── Weekly (7d) ───────────────────────────────────────────
+  tft.setTextColor(tft.color565(160, 160, 160), TFT_BLACK);
+  tft.drawString("WEEKLY  (7d)", 8, 97);
+
+  snprintf(pctBuf, sizeof(pctBuf), "%d%%", latest.weeklyPct);
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextColor(latest.weeklyPct >= 80 ? TFT_RED : TFT_WHITE, TFT_BLACK);
+  tft.drawString(pctBuf, 314, 97);
+  tft.setTextDatum(TL_DATUM);
+
+  drawBar(8, 111, 304, 22, latest.weeklyPct);
+
+  tft.setTextColor(tft.color565(110, 110, 110), TFT_BLACK);
+  tft.drawString(("Resets in " + fmtTime(latest.weeklyReset)).c_str(), 8, 139);
 
   drawFooter();
 }
@@ -228,7 +187,7 @@ void setup() {
   tft.fillScreen(TFT_BLACK);
 
   connectWifi();
-  if (wifiOk) fetchAll();
+  if (wifiOk) fetchUsage();
   drawScreen();
 }
 
@@ -241,10 +200,10 @@ void loop() {
   }
 
   if (wifiOk && (lastFetchMs == 0 || millis() - lastFetchMs >= 5UL * 60 * 1000)) {
-    fetchAll();
+    fetchUsage();
     drawScreen();
   } else {
-    drawFooter(); // update the countdown without a full redraw
+    drawFooter();
   }
 
   delay(30000);
